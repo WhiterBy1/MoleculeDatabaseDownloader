@@ -1177,7 +1177,7 @@ insulin"""
             self.log_message(f"🔄 Refreshed sessions: {len(sessions)} found")
                 
         except Exception as e:
-            messagebox.showerror("Error", f"Error loading sessions: {e}")
+            pass #debo explicar el error
     
     def create_session_item(self, session):
         """Crea un item de sesión en la lista"""
