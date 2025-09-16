@@ -1,6 +1,6 @@
 # downloader.py
 """
-Lógica principal de descarga de moléculas
+Lógica principal de descarga de moléculas - VERSIÓN ROBUSTA
 INPUT: molecule_id, source_name
 OUTPUT: sdf_content (str) or None
 """
@@ -8,7 +8,9 @@ OUTPUT: sdf_content (str) or None
 import requests
 import time
 from rdkit import Chem
-from rdkit.Chem import AllChem
+from rdkit.Chem import AllChem, rdDistGeom, rdMolDescriptors
+from rdkit.Chem.rdDistGeom import EmbedMolecule
+import numpy as np
 from config import TIMEOUT, RETRY_ATTEMPTS, DELAY_BETWEEN_REQUESTS
 from storage import StorageManager
 
@@ -108,22 +110,26 @@ class MoleculeDownloader:
         """
         self._log(f"⬇️ Descargando estructura para ID {molecule_id}...")
         
-        # Intentar 3D primero
-        sdf_content = self._download_sdf(molecule_id, source_name, format_3d=True)
+        # Estrategia: Siempre descargar 2D primero para tener estructura limpia
+        self._log("📥 Descargando estructura 2D para base limpia...")
+        sdf_2d = self._download_sdf(molecule_id, source_name, format_3d=False)
         
-        if sdf_content:
-            self._log("✅ Estructura 3D descargada")
-            return self._process_structure(sdf_content)
+        if sdf_2d:
+            self._log("✅ Estructura 2D descargada, generando 3D optimizada...")
+            result_3d = self._convert_2d_to_3d_robust(sdf_2d)
+            if result_3d:
+                return result_3d
         
-        # Si no hay 3D, intentar 2D y convertir
-        self._log("⚠️ Estructura 3D no disponible, intentando 2D...")
-        sdf_content = self._download_sdf(molecule_id, source_name, format_3d=False)
+        # Fallback: intentar 3D de PubChem pero procesarla
+        self._log("⚠️ Intentando 3D de PubChem como fallback...")
+        sdf_3d = self._download_sdf(molecule_id, source_name, format_3d=True)
         
-        if sdf_content:
-            self._log("✅ Estructura 2D descargada, convirtiendo a 3D...")
-            return self._convert_2d_to_3d(sdf_content)
+        if sdf_3d:
+            result_cleaned = self._clean_broken_3d_structure(sdf_3d)
+            if result_cleaned and self._validate_3d_structure(result_cleaned):
+                return result_cleaned
         
-        self._log("❌ No se pudo descargar ninguna estructura")
+        self._log("❌ No se pudo obtener estructura válida")
         return None
     
     def _download_sdf(self, molecule_id, source_name, format_3d=True):
@@ -151,57 +157,83 @@ class MoleculeDownloader:
         
         return None
     
-    def _process_structure(self, sdf_content):
+    def _clean_broken_3d_structure(self, sdf_content):
         """
-        Procesa la estructura descargada (añadir hidrógenos si es necesario)
+        Limpia estructuras 3D con hidrógenos en (0,0,0)
         
         INPUT:
-        - sdf_content (str): Contenido SDF original
+        - sdf_content (str): Contenido SDF con hidrógenos problemáticos
         
         OUTPUT:
-        - str: Contenido SDF procesado
+        - str: Contenido SDF corregido o None
         """
         try:
+            self._log("🧹 Limpiando estructura 3D problemática...")
+            
             mol = Chem.MolFromMolBlock(sdf_content)
             if mol is None:
-                self._log("⚠️ No se pudo leer la estructura")
-                return sdf_content
+                return None
             
-            # Verificar si tiene hidrógenos explícitos
-            h_count_explicit = sum(1 for atom in mol.GetAtoms() if atom.GetAtomicNum() == 1)
-            h_count_implicit = sum(atom.GetTotalNumHs() for atom in mol.GetAtoms())
+            # Estrategia: Mantener átomos pesados, regenerar hidrógenos
+            mol_heavy = Chem.RemoveHs(mol)  # Quitar todos los hidrógenos
             
-            if h_count_explicit == 0 and h_count_implicit > 0:
-                self._log("🔧 Añadiendo hidrógenos explícitos...")
-                mol = Chem.AddHs(mol)
+            if mol.GetNumConformers() > 0:
+                # Extraer coordenadas de átomos pesados
+                old_conf = mol.GetConformer()
+                heavy_coords = []
                 
-                # Verificar si tiene coordenadas 3D
-                try:
-                    conf = mol.GetConformer()
-                    if not conf.Is3D():
-                        self._log("🔧 Optimizando geometría 3D...")
-                        AllChem.EmbedMolecule(mol, AllChem.ETKDG())
-                        AllChem.UFFOptimizeMolecule(mol)
-                except:
-                    pass
+                heavy_idx = 0
+                for atom_idx in range(mol.GetNumAtoms()):
+                    atom = mol.GetAtomWithIdx(atom_idx)
+                    if atom.GetAtomicNum() != 1:  # No es hidrógeno
+                        pos = old_conf.GetAtomPosition(atom_idx)
+                        heavy_coords.append((pos.x, pos.y, pos.z))
+                        heavy_idx += 1
                 
-                return Chem.MolToMolBlock(mol)
+                # Crear nueva molécula con hidrógenos
+                mol_with_h = Chem.AddHs(mol_heavy)
+                
+                # Aplicar coordenadas a átomos pesados
+                new_conf = Chem.Conformer(mol_with_h.GetNumAtoms())
+                heavy_idx = 0
+                
+                for atom_idx in range(mol_with_h.GetNumAtoms()):
+                    atom = mol_with_h.GetAtomWithIdx(atom_idx)
+                    if atom.GetAtomicNum() != 1:  # Átomo pesado
+                        if heavy_idx < len(heavy_coords):
+                            x, y, z = heavy_coords[heavy_idx]
+                            new_conf.SetAtomPosition(atom_idx, [x, y, z])
+                            heavy_idx += 1
+                    else:
+                        # Hidrógeno: posición temporal (se optimizará)
+                        new_conf.SetAtomPosition(atom_idx, [0, 0, 0])
+                
+                mol_with_h.AddConformer(new_conf, assignId=True)
+                
+                # Optimizar solo hidrógenos manteniendo átomos pesados fijos
+                self._optimize_hydrogen_positions(mol_with_h)
+                
+                result_sdf = Chem.MolToMolBlock(mol_with_h)
+                
+                if self._validate_3d_structure(result_sdf):
+                    self._log("✅ Estructura 3D limpiada exitosamente")
+                    return result_sdf
             
-            return sdf_content
+            return None
             
         except Exception as e:
-            self._log(f"⚠️ Error procesando estructura: {e}")
-            return sdf_content
+            self._log(f"❌ Error limpiando estructura 3D: {e}")
+            return None
     
-    def _convert_2d_to_3d(self, sdf_content):
+    def _convert_2d_to_3d_robust(self, sdf_content):
         """
-        Convierte estructura 2D a 3D usando RDKit
+        Conversión robusta de 2D a 3D con múltiples estrategias
         
         INPUT:
         - sdf_content (str): Contenido SDF 2D
         
         OUTPUT:
-        - str: Contenido SDF 3D o None si falla
+        - str: Contenido SDF 3D o None
         """
         try:
             mol = Chem.MolFromMolBlock(sdf_content)
@@ -209,35 +241,219 @@ class MoleculeDownloader:
                 self._log("❌ No se pudo leer estructura 2D")
                 return None
             
-            # Añadir hidrógenos
-            mol = Chem.AddHs(mol)
+            # Preparar molécula limpia
+            mol = Chem.RemoveHs(mol)  # Quitar hidrógenos si los hay
+            mol = Chem.AddHs(mol)     # Añadir hidrógenos limpios
             
-            # Generar conformación 3D
-            params = AllChem.ETKDG()
-            params.randomSeed = 42  # Para reproducibilidad
-            embed_result = AllChem.EmbedMolecule(mol, params)
-            
-            if embed_result == -1:
-                self._log("⚠️ Intentando con parámetros alternativos...")
-                params.useRandomCoords = True
-                embed_result = AllChem.EmbedMolecule(mol, params)
-            
-            if embed_result != -1:
-                # Optimizar geometría
+            # Estrategia 1: ETKDG mejorado con múltiples intentos
+            self._log("🔄 Generando 3D con ETKDG mejorado...")
+            for attempt in range(5):
                 try:
-                    AllChem.UFFOptimizeMolecule(mol, maxIters=500)
-                    self._log("✅ Estructura 3D generada y optimizada")
-                except:
-                    self._log("⚠️ Optimización parcialmente exitosa")
+                    mol_copy = Chem.Mol(mol)  # Copia para cada intento
+                    
+                    params = AllChem.ETKDG()
+                    params.randomSeed = 42 + attempt * 123
+                    params.maxAttempts = 100
+                    params.numThreads = 1
+                    params.useExpTorsionAnglePrefs = True
+                    params.useBasicKnowledge = True
+                    params.enforceChirality = True
+                    
+                    embed_result = AllChem.EmbedMolecule(mol_copy, params)
+                    
+                    if embed_result != -1:
+                        # Optimización en etapas
+                        self._multi_stage_optimization(mol_copy)
+                        
+                        result_sdf = Chem.MolToMolBlock(mol_copy)
+                        if self._validate_3d_structure(result_sdf):
+                            self._log(f"✅ ETKDG exitoso en intento {attempt + 1}")
+                            return result_sdf
                 
-                return Chem.MolToMolBlock(mol)
-            else:
-                self._log("❌ No se pudo generar conformación 3D")
-                return None
+                except Exception as e:
+                    self._log(f"⚠️ ETKDG intento {attempt + 1} falló: {e}")
+                    continue
+            
+            # Estrategia 2: Distance Geometry con conformaciones múltiples
+            self._log("🔄 Intentando Distance Geometry...")
+            try:
+                mol_copy = Chem.Mol(mol)
                 
-        except Exception as e:
-            self._log(f"❌ Error convirtiendo 2D a 3D: {e}")
+                # Generar múltiples conformaciones y elegir la mejor
+                conf_ids = rdDistGeom.EmbedMultipleConfs(
+                    mol_copy, 
+                    numConfs=10, 
+                    randomSeed=42,
+                    clearConfs=True,
+                    useExpTorsionAnglePrefs=True,
+                    useBasicKnowledge=True
+                )
+                
+                if conf_ids:
+                    best_conf_id = None
+                    best_energy = float('inf')
+                    
+                    for conf_id in conf_ids:
+                        try:
+                            # Optimizar conformación
+                            ff = AllChem.UFFGetMoleculeForceField(mol_copy, confId=conf_id)
+                            if ff:
+                                ff.Minimize(maxIts=500)
+                                energy = ff.CalcEnergy()
+                                
+                                if energy < best_energy:
+                                    best_energy = energy
+                                    best_conf_id = conf_id
+                        except:
+                            continue
+                    
+                    if best_conf_id is not None:
+                        result_sdf = Chem.MolToMolBlock(mol_copy, confId=best_conf_id)
+                        if self._validate_3d_structure(result_sdf):
+                            self._log("✅ Distance Geometry exitoso")
+                            return result_sdf
+            
+            except Exception as e:
+                self._log(f"⚠️ Distance Geometry falló: {e}")
+            
+            # Estrategia 3: Generación básica forzada
+            self._log("🔄 Generación básica como último recurso...")
+            try:
+                mol_copy = Chem.Mol(mol)
+                
+                params = AllChem.ETKDG()
+                params.useRandomCoords = True
+                params.randomSeed = -1
+                params.maxAttempts = 200
+                params.enforceChirality = False
+                params.useExpTorsionAnglePrefs = False
+                
+                if AllChem.EmbedMolecule(mol_copy, params) != -1:
+                    # Optimización básica
+                    try:
+                        AllChem.UFFOptimizeMolecule(mol_copy, maxIters=1000)
+                    except:
+                        pass
+                    
+                    result_sdf = Chem.MolToMolBlock(mol_copy)
+                    self._log("⚠️ Generada conformación básica")
+                    return result_sdf
+            
+            except Exception as e:
+                self._log(f"❌ Generación básica falló: {e}")
+            
             return None
+            
+        except Exception as e:
+            self._log(f"❌ Error en conversión 2D→3D: {e}")
+            return None
+    
+    def _multi_stage_optimization(self, mol):
+        """
+        Optimización en múltiples etapas para mejor geometría
+        
+        INPUT:
+        - mol: Molécula RDKit con conformación
+        """
+        try:
+            # Etapa 1: Optimización suave
+            ff = AllChem.UFFGetMoleculeForceField(mol)
+            if ff:
+                ff.Minimize(maxIts=100, forceTol=1e-3)
+            
+            # Etapa 2: Optimización normal
+            AllChem.UFFOptimizeMolecule(mol, maxIters=500)
+            
+            # Etapa 3: Optimización fina
+            ff = AllChem.UFFGetMoleculeForceField(mol)
+            if ff:
+                ff.Minimize(maxIts=200, forceTol=1e-4)
+        
+        except Exception as e:
+            self._log(f"⚠️ Optimización parcial: {e}")
+    
+    def _optimize_hydrogen_positions(self, mol):
+        """
+        Optimiza solo las posiciones de hidrógenos manteniendo átomos pesados fijos
+        
+        INPUT:
+        - mol: Molécula RDKit con conformación
+        """
+        try:
+            ff = AllChem.UFFGetMoleculeForceField(mol)
+            if not ff:
+                return
+            
+            # Fijar todos los átomos pesados
+            for atom_idx in range(mol.GetNumAtoms()):
+                atom = mol.GetAtomWithIdx(atom_idx)
+                if atom.GetAtomicNum() != 1:  # No es hidrógeno
+                    ff.AddFixedPoint(atom_idx)
+            
+            # Optimizar solo hidrógenos
+            ff.Minimize(maxIts=500)
+            
+        except Exception as e:
+            self._log(f"⚠️ Optimización de hidrógenos parcial: {e}")
+    
+    def _validate_3d_structure(self, sdf_content):
+        """
+        Valida si la estructura 3D tiene coordenadas válidas
+        
+        INPUT:
+        - sdf_content (str): Contenido SDF
+        
+        OUTPUT:
+        - bool: True si tiene coordenadas 3D válidas
+        """
+        try:
+            mol = Chem.MolFromMolBlock(sdf_content)
+            if mol is None or mol.GetNumConformers() == 0:
+                return False
+            
+            conf = mol.GetConformer()
+            total_atoms = mol.GetNumAtoms()
+            
+            # Contar átomos en (0,0,0)
+            zero_coords = 0
+            all_coords = []
+            
+            for i in range(total_atoms):
+                pos = conf.GetAtomPosition(i)
+                all_coords.append([pos.x, pos.y, pos.z])
+                
+                if abs(pos.x) < 0.001 and abs(pos.y) < 0.001 and abs(pos.z) < 0.001:
+                    zero_coords += 1
+            
+            # Test 1: No más de 1 átomo en (0,0,0)
+            if zero_coords > 1:
+                self._log(f"❌ Validación fallida: {zero_coords} átomos en (0,0,0)")
+                return False
+            
+            # Test 2: Verificar dispersión espacial
+            coords_array = np.array(all_coords)
+            
+            # Calcular desviación estándar para cada dimensión
+            std_x = np.std(coords_array[:, 0])
+            std_y = np.std(coords_array[:, 1]) 
+            std_z = np.std(coords_array[:, 2])
+            
+            # Debe haber dispersión en las 3 dimensiones
+            if std_x < 0.1 or std_y < 0.1 or std_z < 0.1:
+                self._log(f"❌ Validación fallida: Baja dispersión 3D (σx={std_x:.3f}, σy={std_y:.3f}, σz={std_z:.3f})")
+                return False
+            
+            # Test 3: Verificar que es realmente 3D
+            if hasattr(conf, 'Is3D') and not conf.Is3D():
+                self._log("❌ Validación fallida: No es estructura 3D")
+                return False
+            
+            self._log(f"✅ Estructura válida: {total_atoms} átomos, dispersión 3D adecuada")
+            return True
+            
+        except Exception as e:
+            self._log(f"⚠️ Error en validación: {e}")
+            return False
     
     def _log(self, message):
         """Helper para logging"""
