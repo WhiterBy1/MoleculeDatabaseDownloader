@@ -1,4 +1,10 @@
 molecules/
 progress/
 __pycache__/
-
+DatabaseActive/
+pruebas/
+test/
+cache/
+downgrade/
+.vscode/
+vanessa.py

@@ -13,6 +13,16 @@ from rdkit.Chem.rdDistGeom import EmbedMolecule
 import numpy as np
 from config import TIMEOUT, RETRY_ATTEMPTS, DELAY_BETWEEN_REQUESTS
 from storage import StorageManager
+#velocity optimizing
+import concurrent.futures
+import threading
+from functools import lru_cache
+import pickle
+import os
+import hashlib
+import gzip
+import json
+from pathlib import Path
 
 class MoleculeDownloader:
     """Descargador principal de moléculas"""
@@ -25,11 +35,49 @@ class MoleculeDownloader:
         self.source_manager = source_manager
         self.storage_manager = StorageManager()
         
+        #parallel config
+        self.cache_dir = Path("./cache")
+        self.cache_dir.mkdir(exist_ok=True)
+        self.max_workers = 6  # Configurable
+        self.use_parallel = True  # Flag para activar/desactivar
+        
+        # Session reutilizable para velocidad
+        self.session = self._setup_optimized_session()
+        
         # Configuración
         self.output_dir = "./molecules"
         self.categorize_by = "formula"
         self.progress_callback = None
         self.log_callback = None
+    
+    def _setup_optimized_session(self):
+        """NUEVA: Sesión HTTP optimizada"""
+        session = requests.Session()
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (compatible; MoleculeDownloader/2.0)',
+            'Accept': 'text/plain,application/sdf',
+            'Connection': 'keep-alive'
+        })
+        
+        # Configuración de reintentos más agresiva
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+        
+        retry_strategy = Retry(
+            total=2,
+            status_forcelist=[429, 500, 502, 503, 504],
+            backoff_factor=0.1
+        )
+        
+        adapter = HTTPAdapter(
+            max_retries=retry_strategy,
+            pool_connections=10,
+            pool_maxsize=10
+        )
+        
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        return session
     
     def configure(self, output_dir=None, categorize_by=None, progress_callback=None, log_callback=None):
         """
@@ -51,6 +99,246 @@ class MoleculeDownloader:
         
         self.progress_callback = progress_callback
         self.log_callback = log_callback
+    
+    
+    
+    # NUEVO: Método para lotes paralelos
+    def download_molecules_batch(self, queries, source_name="pubchem"):
+        """
+        NUEVO: Descarga por lotes con paralelización automática
+        Se activa automáticamente para >3 moléculas
+        """
+        if len(queries) <= 3 or not self.use_parallel:
+            # Para pocas moléculas, usar método secuencial
+            return self._download_sequential(queries, source_name)
+        else:
+            # Para muchas moléculas, usar paralelo
+            return self._download_parallel(queries, source_name)
+    
+    def _download_sequential(self, queries, source_name):
+        """Descarga secuencial (método original)"""
+        results = {}
+        for query in queries:
+            results[query] = self.download_molecule(query, source_name)
+        return results
+    
+    def _download_parallel(self, queries, source_name):
+        """NUEVA: Descarga paralela optimizada"""
+        self._log(f"🚀 Iniciando descarga paralela: {len(queries)} moléculas con {self.max_workers} hilos")
+        
+        results = {}
+        start_time = time.time()
+        
+        # Fase 1: Búsqueda paralela de IDs
+        molecule_ids = self._parallel_search(queries, source_name)
+        
+        # Fase 2: Descarga paralela
+        valid_queries = [(query, ids[0]) for query, ids in molecule_ids.items() if ids]
+        failed_searches = [query for query, ids in molecule_ids.items() if not ids]
+        
+        # Marcar búsquedas fallidas
+        for query in failed_searches:
+            results[query] = False
+        
+        # Descargar las válidas
+        if valid_queries:
+            download_results = self._parallel_download_structures(valid_queries, source_name)
+            results.update(download_results)
+        
+        # Estadísticas
+        end_time = time.time()
+        successful = sum(1 for success in results.values() if success)
+        self._log(f"⚡ Completado en {end_time - start_time:.2f}s - {successful}/{len(queries)} exitosas")
+        
+        return results
+    
+    def _parallel_search(self, queries, source_name):
+        """Búsqueda de IDs en paralelo con cache"""
+        results = {}
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            future_to_query = {
+                executor.submit(self._search_with_cache, query, source_name): query 
+                for query in queries
+            }
+            
+            for future in concurrent.futures.as_completed(future_to_query):
+                query = future_to_query[future]
+                try:
+                    molecule_ids = future.result()
+                    results[query] = molecule_ids
+                except Exception as e:
+                    self._log(f"❌ Error buscando {query}: {e}")
+                    results[query] = []
+        
+        return results
+    
+    @lru_cache(maxsize=500)
+    def _search_with_cache(self, query, source_name):
+        """Búsqueda con cache para evitar repeticiones"""
+        cache_file = self.cache_dir / f"search_{hashlib.md5((query + source_name).encode()).hexdigest()}.pkl"
+        
+        # Verificar cache
+        if cache_file.exists():
+            try:
+                with open(cache_file, 'rb') as f:
+                    cached_result = pickle.load(f)
+                    if time.time() - cached_result['timestamp'] < 86400:  # 24 horas
+                        return cached_result['ids']
+            except:
+                pass
+        
+        # Búsqueda real
+        molecule_ids = self.source_manager.search_molecule(query, source_name)
+        
+        # Guardar en cache
+        try:
+            with open(cache_file, 'wb') as f:
+                pickle.dump({
+                    'ids': molecule_ids,
+                    'timestamp': time.time()
+                }, f)
+        except:
+            pass
+        
+        return molecule_ids
+    
+    def _parallel_download_structures(self, query_id_pairs, source_name):
+        """Descarga de estructuras en paralelo"""
+        results = {}
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            future_to_query = {
+                executor.submit(self._download_single_structure, query, mol_id, source_name): query 
+                for query, mol_id in query_id_pairs
+            }
+            
+            for future in concurrent.futures.as_completed(future_to_query):
+                query = future_to_query[future]
+                try:
+                    success = future.result()
+                    results[query] = success
+                except Exception as e:
+                    self._log(f"❌ Error descargando {query}: {e}")
+                    results[query] = False
+        
+        return results
+    
+    
+    def _download_single_structure(self, query, molecule_id, source_name):
+        """Descarga individual optimizada"""
+        try:
+            # Verificar cache
+            cache_file = self.cache_dir / f"structure_{molecule_id}_{source_name}.sdf"
+            if cache_file.exists():
+                try:
+                    with open(cache_file, 'r') as f:
+                        sdf_content = f.read()
+                        if self._validate_3d_structure_fast(sdf_content):
+                            # Guardar desde cache
+                            success = self.storage_manager.save_molecule(sdf_content, query, molecule_id)
+                            if success:
+                                self._log(f"💾 {query} (desde cache)")
+                            return success
+                except:
+                    pass
+            
+            # Descargar nueva
+            sdf_content = self._download_structure_optimized(molecule_id, source_name)
+            
+            if sdf_content:
+                # Guardar en cache
+                try:
+                    with open(cache_file, 'w') as f:
+                        f.write(sdf_content)
+                except:
+                    pass
+                
+                # Guardar molécula
+                success = self.storage_manager.save_molecule(sdf_content, query, molecule_id)
+                if success:
+                    self._log(f"✅ {query}")
+                return success
+            
+            return False
+            
+        except Exception as e:
+            self._log(f"❌ Error con {query}: {e}")
+            return False
+    
+    def _download_structure_optimized(self, molecule_id, source_name):
+        """Descarga optimizada usando session reutilizable"""
+        # Usar 2D para velocidad y confiabilidad
+        download_url = self.source_manager.get_download_url(molecule_id, source_name, format_3d=False)
+        
+        if not download_url:
+            return None
+        
+        try:
+            response = self.session.get(download_url, timeout=10)
+            if response.status_code == 200:
+                return self._convert_2d_to_3d_fast(response.text)
+        except:
+            pass
+        
+        return None
+    
+    def _convert_2d_to_3d_fast(self, sdf_content):
+        """Conversión 2D→3D optimizada para velocidad"""
+        try:
+            mol = Chem.MolFromMolBlock(sdf_content)
+            if mol is None:
+                return None
+            
+            mol = Chem.RemoveHs(mol)
+            mol = Chem.AddHs(mol)
+            
+            # Parámetros optimizados para velocidad
+            params = AllChem.ETKDG()
+            params.randomSeed = 42
+            params.maxAttempts = 25  # Reducido para velocidad
+            params.useExpTorsionAnglePrefs = False  # Más rápido
+            
+            if AllChem.EmbedMolecule(mol, params) != -1:
+                AllChem.UFFOptimizeMolecule(mol, maxIters=200)
+                result_sdf = Chem.MolToMolBlock(mol)
+                
+                if self._validate_3d_structure_fast(result_sdf):
+                    return result_sdf
+            
+            return None
+            
+        except Exception:
+            return None
+    
+    def _validate_3d_structure_fast(self, sdf_content):
+        """Validación rápida"""
+        try:
+            mol = Chem.MolFromMolBlock(sdf_content)
+            if mol is None or mol.GetNumConformers() == 0:
+                return False
+            
+            conf = mol.GetConformer()
+            zero_coords = 0
+            
+            # Solo verificar primeros 5 átomos para velocidad
+            check_atoms = min(5, mol.GetNumAtoms())
+            for i in range(check_atoms):
+                pos = conf.GetAtomPosition(i)
+                if abs(pos.x) < 0.001 and abs(pos.y) < 0.001 and abs(pos.z) < 0.001:
+                    zero_coords += 1
+            
+            return zero_coords <= 1
+            
+        except Exception:
+            return False
+    
+    # Configuración de paralelización
+    def set_parallel_config(self, max_workers=6, use_parallel=True):
+        """Configura parámetros de paralelización"""
+        self.max_workers = max_workers
+        self.use_parallel = use_parallel
+        self._log(f"🔧 Configuración paralela: {max_workers} hilos, activo: {use_parallel}")
     
     def download_molecule(self, query, source_name="pubchem"):
         """

@@ -32,9 +32,9 @@ class MoleculeApp:
     
     def __init__(self):
         self.root = ctk.CTk()
-        self.root.title("🧪 Molecular Structure Downloader Pro")
+        self.root.title(" Molecular Structure Downloader")
         self.root.geometry("1400x900")
-        self.root.minsize(1200, 800)
+        self.root.minsize(100,100 )
         
         # Configurar icono de la ventana
         try:
@@ -136,7 +136,7 @@ class MoleculeApp:
         
         title_label = ctk.CTkLabel(
             title_frame,
-            text="🧪 Molecular Downloader Pro",
+            text=" Molecular Downloader ",
             font=ctk.CTkFont(size=26, weight="bold")
         )
         title_label.pack(anchor="w")
@@ -406,6 +406,57 @@ class MoleculeApp:
         )
         source_combo.pack(anchor="w", padx=20, pady=(0, 20))
         
+        # Tarjeta de optimización de velocidad
+        speed_card = ctk.CTkFrame(scrollable_frame)
+        speed_card.pack(fill="x", pady=(0, 15))
+
+        ctk.CTkLabel(
+            speed_card,
+            text="⚡ Speed Optimization",
+            font=ctk.CTkFont(size=16, weight="bold")
+        ).pack(anchor="w", padx=20, pady=(20, 10))
+
+        speed_frame = ctk.CTkFrame(speed_card, fg_color="transparent")
+        speed_frame.pack(fill="x", padx=20, pady=(0, 20))
+
+        # Switch para paralelización
+        self.parallel_enabled = ctk.BooleanVar(value=True)
+        parallel_switch = ctk.CTkSwitch(
+            speed_frame,
+            text="Enable Parallel Downloads",
+            variable=self.parallel_enabled,
+            command=self.update_parallel_config
+        )
+        parallel_switch.pack(anchor="w", pady=(0, 10))
+
+        # Slider para hilos
+        thread_frame = ctk.CTkFrame(speed_frame, fg_color="transparent")
+        thread_frame.pack(fill="x", pady=(0, 10))
+
+        ctk.CTkLabel(thread_frame, text="Parallel Threads:", width=120).pack(side="left")
+
+        self.thread_slider = ctk.CTkSlider(
+            thread_frame,
+            from_=2, to=12, number_of_steps=10,
+            command=self.update_thread_count
+        )
+        self.thread_slider.set(6)
+        self.thread_slider.pack(side="left", padx=(10, 10))
+
+        self.thread_label = ctk.CTkLabel(thread_frame, text="6 threads")
+        self.thread_label.pack(side="left")
+
+        # Info sobre optimizaciones
+        info_text = "• Parallel downloads for batches >5 molecules\n• Smart caching to avoid re-downloads\n• Optimized network connections\n• Fast 2D→3D conversion"
+
+        info_label = ctk.CTkLabel(
+            speed_card,
+            text=info_text,
+            font=ctk.CTkFont(size=11),
+            justify="left"
+        )
+        info_label.pack(anchor="w", padx=20, pady=(0, 20))
+        
         # Botón de guardar configuración
         save_btn = ctk.CTkButton(
             scrollable_frame,
@@ -663,7 +714,7 @@ insulin"""
         
         # Preview
         preview_card = ctk.CTkFrame(scrollable_frame)
-        preview_card.pack(fill="both", expand=True, pady=(0, 15))
+        preview_card.pack(fill="both", expand=False, pady=(0, 15))
         
         ctk.CTkLabel(
             preview_card,
@@ -676,7 +727,7 @@ insulin"""
             height=200,
             font=ctk.CTkFont(size=11)
         )
-        self.excel_preview.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+        self.excel_preview.pack(fill="both", expand=False, padx=5, pady=(0, 10))
         
         # Botones de acción
         action_frame = ctk.CTkFrame(scrollable_frame, fg_color="transparent")
@@ -1309,8 +1360,84 @@ insulin"""
     # =========================================================================
     # FUNCIONALIDADES DE DESCARGA EN LOTES
     # =========================================================================
-    
     def _download_batch_thread(self, queries, session_id):
+        """Versión mejorada con paralelización automática"""
+        try:
+            self.root.after(0, lambda: self.update_status(f"Processing {len(queries)} molecules"))
+
+            # Decidir estrategia según cantidad
+            if len(queries) > 5:
+                self.log_message(f"🚀 Usando descarga PARALELA para {len(queries)} moléculas")
+                strategy = "parallel"
+            else:
+                self.log_message(f"🔍 Usando descarga secuencial para {len(queries)} moléculas")
+                strategy = "sequential"
+
+            # Configurar descargador
+            self.downloader.configure(
+                output_dir=self.output_dir.get(),
+                categorize_by=self.categorize_by.get(),
+                progress_callback=self.update_progress,
+                log_callback=self.log_message
+            )
+
+            # Configurar paralelización según cantidad
+            if strategy == "parallel":
+                # Calcular hilos óptimos según cantidad de moléculas
+                optimal_workers = min(8, max(4, len(queries) // 10))
+                self.downloader.set_parallel_config(max_workers=optimal_workers, use_parallel=True)
+            else:
+                self.downloader.set_parallel_config(use_parallel=False)
+
+            # Ejecutar descarga (automáticamente elige estrategia)
+            if hasattr(self.downloader, 'download_molecules_batch'):
+                results = self.downloader.download_molecules_batch(queries, self.source.get())
+
+                # Procesar resultados
+                completed = sum(1 for success in results.values() if success)
+                failed = len(results) - completed
+
+                # Actualizar sesión
+                for query, success in results.items():
+                    if success:
+                        self.progress_manager.update_progress(session_id, completed_query=query)
+                    else:
+                        self.progress_manager.update_progress(session_id, failed_query=query)
+            else:
+                # Fallback al método original
+                completed = 0
+                failed = 0
+
+                for i, query in enumerate(queries):
+                    self.root.after(0, lambda i=i, total=len(queries): self.update_progress(i, total))
+
+                    success = self.downloader.download_molecule(query, self.source.get())
+
+                    if success:
+                        completed += 1
+                        self.progress_manager.update_progress(session_id, completed_query=query)
+                    else:
+                        failed += 1
+                        self.progress_manager.update_progress(session_id, failed_query=query)
+
+            # Completar sesión
+            self.progress_manager.complete_session(session_id)
+            self.root.after(0, lambda: self.update_progress(len(queries), len(queries)))
+
+            message = f"Proceso completado:\n✅ Exitosas: {completed}\n❌ Fallidas: {failed}\n📊 Total: {len(queries)}"
+            self.log_message(message)
+            self.root.after(0, lambda: messagebox.showinfo("Completed", message))
+
+        except Exception as e:
+            self.log_message(f"❌ Error crítico: {e}")
+            self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
+        finally:
+            self.is_processing = False
+            self.current_session_id = None
+            self.root.after(0, lambda: self.update_status("Ready"))
+
+
+    def _download_batch_thread_downgraded(self, queries, session_id):
         """Thread para descarga por lotes con manejo de sesiones"""
         try:
             self.root.after(0, lambda: self.update_status(f"Processing {len(queries)} molecules"))
@@ -1407,6 +1534,79 @@ insulin"""
                 success_rate = (completed / (completed + failed)) * 100 if (completed + failed) > 0 else 0
                 self.stats_labels['success_rate'].configure(text=f"{success_rate:.1f}%")
     
+    def add_speed_settings_to_gui(self):
+        """Añadir a la vista de configuración en modern_main.py"""
+
+        # En el método show_settings(), añadir después de las tarjetas existentes:
+
+        # Tarjeta de optimización de velocidad
+        speed_card = ctk.CTkFrame(scrollable_frame)
+        speed_card.pack(fill="x", pady=(0, 15))
+
+        ctk.CTkLabel(
+            speed_card,
+            text="⚡ Speed Optimization",
+            font=ctk.CTkFont(size=16, weight="bold")
+        ).pack(anchor="w", padx=20, pady=(20, 10))
+
+        speed_frame = ctk.CTkFrame(speed_card, fg_color="transparent")
+        speed_frame.pack(fill="x", padx=20, pady=(0, 20))
+
+        # Switch para paralelización
+        self.parallel_enabled = ctk.BooleanVar(value=True)
+        parallel_switch = ctk.CTkSwitch(
+            speed_frame,
+            text="Enable Parallel Downloads",
+            variable=self.parallel_enabled,
+            command=self.update_parallel_config
+        )
+        parallel_switch.pack(anchor="w", pady=(0, 10))
+
+        # Slider para hilos
+        thread_frame = ctk.CTkFrame(speed_frame, fg_color="transparent")
+        thread_frame.pack(fill="x", pady=(0, 10))
+
+        ctk.CTkLabel(thread_frame, text="Parallel Threads:", width=120).pack(side="left")
+
+        self.thread_slider = ctk.CTkSlider(
+            thread_frame,
+            from_=2, to=12, number_of_steps=10,
+            command=self.update_thread_count
+        )
+        self.thread_slider.set(6)
+        self.thread_slider.pack(side="left", padx=(10, 10))
+
+        self.thread_label = ctk.CTkLabel(thread_frame, text="6 threads")
+        self.thread_label.pack(side="left")
+
+        # Info sobre optimizaciones
+        info_text = "• Parallel downloads for batches >5 molecules\n• Smart caching to avoid re-downloads\n• Optimized network connections\n• Fast 2D→3D conversion"
+
+        info_label = ctk.CTkLabel(
+            speed_card,
+            text=info_text,
+            font=ctk.CTkFont(size=11),
+            justify="left"
+        )
+        info_label.pack(anchor="w", padx=20, pady=(0, 20))
+
+    def update_parallel_config(self):
+        """Callback para actualizar configuración paralela"""
+        enabled = self.parallel_enabled.get()
+        threads = int(self.thread_slider.get())
+
+        if hasattr(self.downloader, 'set_parallel_config'):
+            self.downloader.set_parallel_config(max_workers=threads, use_parallel=enabled)
+            self.log_message(f"🔧 Configuración actualizada: {threads} hilos, paralelo: {enabled}")
+
+    def update_thread_count(self, value):
+        """Callback para slider de hilos"""
+        threads = int(value)
+        self.thread_label.configure(text=f"{threads} threads")
+        if hasattr(self.downloader, 'set_parallel_config'):
+            self.downloader.set_parallel_config(max_workers=threads, use_parallel=self.parallel_enabled.get())
+
+
     def log_message(self, message):
         """Añade mensaje al log"""
         timestamp = time.strftime('%H:%M:%S')
@@ -1415,7 +1615,7 @@ insulin"""
         if hasattr(self, 'log_textbox'):
             self.log_textbox.insert("end", log_entry)
             self.log_textbox.see("end")
-        
+    
         print(log_entry.strip())  # También imprimir en consola
     
     def clear_log(self):
